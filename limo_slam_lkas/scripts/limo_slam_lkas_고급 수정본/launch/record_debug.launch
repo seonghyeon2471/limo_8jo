@@ -1,0 +1,5 @@
+<launch>
+  <node pkg="rosbag" type="record" name="record_slam_lkas"
+        args="-O slam_lkas_debug.bag /tf /tf_static /map /odom /cmd_vel /camera/image_raw /move_base/NavfnROS/plan /slam_lkas_debug"
+        output="screen" />
+</launch>

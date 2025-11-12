@@ -1,0 +1,11 @@
+<launch>
+  <rosparam file="$(find limo_slam_lkas)/config/camera.yaml" command="load" />
+  <rosparam file="$(find limo_slam_lkas)/config/lkas.yaml" command="load" />
+  <rosparam file="$(find limo_slam_lkas)/config/fusion.yaml" command="load" />
+
+  <node pkg="dynamic_reconfigure" type="dynparam" name="fusion_dynparam"
+        args="load /slam_lkas_fusion $(find limo_slam_lkas)/config/fusion.yaml" />
+
+  <node pkg="limo_slam_lkas" type="lane_bev_node.py" name="lane_bev_node" output="screen" />
+  <node pkg="limo_slam_lkas" type="slam_lkas_fusion.py" name="slam_lkas_fusion" output="screen" />
+</launch>

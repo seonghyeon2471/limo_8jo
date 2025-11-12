@@ -1,0 +1,7 @@
+image_topic: "/camera/image_raw"
+roi_top_ratio: 0.45
+canny_lo: 50
+canny_hi: 150
+hough_thresh: 24
+hough_min_len: 32
+hough_max_gap: 22

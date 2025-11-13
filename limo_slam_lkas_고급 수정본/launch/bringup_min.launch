@@ -1,0 +1,10 @@
+<launch>
+  <rosparam file="$(find limo_slam_lkas)/config/camera.yaml" command="load" />
+  <rosparam file="$(find limo_slam_lkas)/config/lkas.yaml" command="load" />
+  <rosparam file="$(find limo_slam_lkas)/config/fusion.yaml" command="load" />
+
+  <node pkg="limo_slam_lkas" type="lane_bev_node.py" name="lane_bev_node" output="screen" />
+  <node pkg="limo_slam_lkas" type="pure_pursuit_node.py" name="pure_pursuit" output="screen" />
+  <node pkg="limo_slam_lkas" type="slam_lkas_fusion.py" name="slam_lkas_fusion" output="screen" />
+  <node pkg="limo_slam_lkas" type="diag_heartbeat.py" name="diag_heartbeat" output="log" />
+</launch>

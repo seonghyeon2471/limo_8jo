@@ -1,0 +1,6 @@
+lpf_lane_alpha: 0.5
+lane_detect_timeout: 0.6
+lane_ok_hold: 0.5
+deadzone_angle: 0.05
+lane_speed: 0.28
+no_lane_speed: 0.20

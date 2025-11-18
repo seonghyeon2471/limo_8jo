@@ -1,46 +1,46 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-SLAM + LKAS Fusion Controller (ROS1)
-- Robust against missing inputs and TF hiccups
-- Deterministic timing based on ROS time (sim or real)
-- Thread-safe handling of lane detection
-- Gentle accel/decel and angular-rate limiting
-- Optional stop-when-no-input behavior
 
-Tested structure-wise; tune thresholds per platform/camera.
+"""
+SLAM + BEV Lane Center Fusion Controller (Smooth Version)
+- 카메라 BEV 차선 중앙 offset + SLAM path를 융합해서 cmd_vel 생성
+- 이전 fusion의 lane angle 방식 제거 → 중앙 유지 정확도 증가
+- steering LPF + steering rate limit로 틱틱거림 완전 제거
+- lane 미검출 시 SLAM-only, path 없음 시 안전 정지
 """
 
 import math
-import time
 import threading
 from typing import Optional, Tuple
-
 import numpy as np
+
 import rospy
 import tf
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Path
 from sensor_msgs.msg import Image
+from std_msgs.msg import Float32, Bool
+
 import cv2
 
 
-def normalize_angle(a: float) -> float:
+def normalize_angle(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
-class EWMA(object):
+class EWMA:
+    """지수 이동평균 필터 (LPF)."""
     def __init__(self, alpha=0.6, init_val=0.0):
         self.a = float(alpha)
         self.y = float(init_val)
         self.initialized = False
 
-    def reset(self, val=0.0):
-        self.y = float(val)
+    def reset(self, v):
+        self.y = float(v)
         self.initialized = True
 
-    def filt(self, x: float) -> float:
+    def filt(self, x):
         x = float(x)
         if not self.initialized:
             self.reset(x)
@@ -48,310 +48,262 @@ class EWMA(object):
         return self.y
 
 
-class SlamLkasFusion(object):
+class SlamLkasFusion:
     def __init__(self):
-        rospy.init_node('slam_lkas_fusion')
+        rospy.init_node("fusion_lane_center")
 
-        # === params ===
-        self.rate_hz = rospy.get_param('~rate', 15)
-        self.path_topic = rospy.get_param('~path_topic', '/move_base/NavfnROS/plan')
-        self.image_topic = rospy.get_param('~image_topic', '/camera/image_raw')
-        self.cmd_topic = rospy.get_param('~cmd_topic', '/cmd_vel')
-        self.base_frame = rospy.get_param('~base_frame', 'base_link')
-        self.map_frame = rospy.get_param('~map_frame', 'map')
+        # ========== PARAMS ==========
+        self.rate_hz = rospy.get_param("~rate", 15)
 
-        # Behavior
-        self.stop_when_no_input = rospy.get_param('~stop_when_no_input', True)
+        self.path_topic = rospy.get_param("~path_topic", "/move_base/NavfnROS/plan")
+        self.cmd_topic = rospy.get_param("~cmd_topic", "/cmd_vel")
+        self.base_frame = rospy.get_param("~base_frame", "base_link")
+        self.map_frame = rospy.get_param("~map_frame", "map")
 
-        # Speed/steer limits
-        self.max_speed = rospy.get_param('~max_speed', 0.35)
-        self.min_speed = rospy.get_param('~min_speed', 0.12)
-        self.lane_speed = rospy.get_param('~lane_speed', 0.28)
-        self.no_lane_speed = rospy.get_param('~no_lane_speed', 0.20)
-        self.max_ang = rospy.get_param('~max_angular', 1.2)
+        self.stop_when_no_input = rospy.get_param("~stop_when_no_input", True)
 
-        # Kinematics rate limits
-        self.max_lin_acc = rospy.get_param('~max_lin_acc', 0.25)
-        self.max_lin_dec = rospy.get_param('~max_lin_dec', 0.35)
-        self.max_ang_rate = rospy.get_param('~max_ang_rate', 1.5)
+        # velocity params
+        self.max_speed = rospy.get_param("~max_speed", 0.35)
+        self.min_speed = rospy.get_param("~min_speed", 0.12)
+        self.lane_speed = rospy.get_param("~lane_speed", 0.28)
+        self.no_lane_speed = rospy.get_param("~no_lane_speed", 0.20)
 
-        # Fusion / lookahead
-        self.alpha_lane = rospy.get_param('~alpha_lane', 0.55)
-        self.distance_ahead = rospy.get_param('~distance_ahead', 0.9)
-        self.distance_ahead_hi = rospy.get_param('~distance_ahead_hi', 1.3)
-        self.turn_slowdown_k = rospy.get_param('~turn_slowdown_k', 0.9)
+        # acceleration limits
+        self.max_lin_acc = rospy.get_param("~max_lin_acc", 0.15)
+        self.max_lin_dec = rospy.get_param("~max_lin_dec", 0.25)
 
-        # Detection / trust
-        self.lane_detect_timeout = rospy.get_param('~lane_detect_timeout', 0.6)
-        self.path_timeout = rospy.get_param('~path_timeout', 0.6)
-        self.lane_ok_hold = rospy.get_param('~lane_ok_hold', 0.5)
-        self.deadzone_angle = rospy.get_param('~deadzone_angle', 0.05)
+        # angular velocity limit
+        self.max_ang = rospy.get_param("~max_angular", 1.2)
+        self.max_ang_rate = rospy.get_param("~max_ang_rate", 1.4)
 
-        # LPFs
-        self.lpf_lane_a = rospy.get_param('~lpf_lane_alpha', 0.5)
-        self.lpf_path_a = rospy.get_param('~lpf_path_alpha', 0.5)
-        self.lpf_steer_a = rospy.get_param('~lpf_steer_alpha', 0.6)
-        self.lpf_speed_a = rospy.get_param('~lpf_speed_alpha', 0.5)
+        # steering rate limit (중요)
+        self.max_steer_rate = rospy.get_param("~max_steer_rate", 0.25)
 
-        # Image processing params (override in launch as needed)
-        self.roi_top_ratio = rospy.get_param('~roi_top_ratio', 0.45)
-        self.canny_lo = rospy.get_param('~canny_lo', 50)
-        self.canny_hi = rospy.get_param('~canny_hi', 150)
-        self.hough_thresh = rospy.get_param('~hough_thresh', 24)
-        self.hough_min_len = rospy.get_param('~hough_min_len', 32)
-        self.hough_max_gap = rospy.get_param('~hough_max_gap', 22)
+        # fusion weights
+        self.alpha_lane = rospy.get_param("~alpha_lane", 0.55)
+        self.deadzone_angle = rospy.get_param("~deadzone_angle", 0.08)
 
-        # === state ===
+        # path lookahead
+        self.distance_ahead = rospy.get_param("~distance_ahead", 0.9)
+        self.distance_ahead_hi = rospy.get_param("~distance_ahead_hi", 1.3)
+
+        # slowdown on turn
+        self.turn_slowdown_k = rospy.get_param("~turn_slowdown_k", 0.9)
+
+        # ========== STATE ==========
         self.lock = threading.RLock()
-        self.current_path: Optional[Path] = None
+
+        self.current_path = None
         self.last_path_time = 0.0
+        self.path_timeout = rospy.get_param("~path_timeout", 0.6)
 
+        # BEV lane center offset
+        self.lane_offset = 0.0            # -1.0 ~ +1.0
+        self.lane_offset_valid = False
         self.last_lane_time = 0.0
-        self.have_lane_raw = False
-        self.have_lane_latched = False
-        self.lane_angle_raw = 0.0  # unfiltered; filter only in control loop
+        self.lane_timeout = rospy.get_param("~lane_timeout", 0.6)
 
-        self.f_lane = EWMA(self.lpf_lane_a, 0.0)
-        self.f_path = EWMA(self.lpf_path_a, 0.0)
-        self.f_steer = EWMA(self.lpf_steer_a, 0.0)
-        self.f_speed = EWMA(self.lpf_speed_a, self.min_speed)
+        # filters
+        self.f_path = EWMA(0.5)
+        self.f_steer = EWMA(0.6)
+        self.f_speed = EWMA(0.7)
 
         self.prev_lin = 0.0
         self.prev_ang = 0.0
+        self.prev_steer = 0.0
         self.prev_t = rospy.Time.now().to_sec()
 
-        # ROS I/O
+        # ========== ROS IO ==========
         self.cmd_pub = rospy.Publisher(self.cmd_topic, Twist, queue_size=1)
-        rospy.Subscriber(self.path_topic, Path, self.path_callback, queue_size=1)
-        rospy.Subscriber(self.image_topic, Image, self.image_callback, queue_size=1)
+
+        rospy.Subscriber(self.path_topic, Path, self.path_callback)
+        rospy.Subscriber("/lane_center_offset", Float32, self.offset_callback)
+        rospy.Subscriber("/lane_center_valid", Bool, self.offset_valid_callback)
 
         self.tf_listener = tf.TransformListener()
-        self.cv_bridge = CvBridge()
 
-        rospy.loginfo("[slam_lkas_fusion] ready. path_topic=%s image_topic=%s", self.path_topic, self.image_topic)
+        rospy.loginfo("[Fusion] Ready. Using BEV lane center + SLAM")
 
-    # ---------------- Callbacks ----------------
-    def path_callback(self, msg: Path):
+    # ======================================
+    # PATH
+    # ======================================
+    def path_callback(self, msg):
         with self.lock:
             self.current_path = msg
             self.last_path_time = rospy.get_time()
 
-    def image_callback(self, msg: Image):
-        try:
-            # Try bgr8 first; if camera publishes mono16/other, this will throw
-            try:
-                cv_img = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            except CvBridgeError:
-                # Fallback: convert any to mono and then to BGR for robustness
-                cv_img_any = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-                if len(cv_img_any.shape) == 2:
-                    cv_img = cv2.cvtColor(cv_img_any, cv2.COLOR_GRAY2BGR)
-                else:
-                    cv_img = cv_img_any
-        except CvBridgeError as e:
-            rospy.logwarn_throttle(5.0, "CvBridge error: %s", str(e))
-            return
+    # ======================================
+    # LANE CENTER OFFSET
+    # ======================================
+    def offset_callback(self, msg):
+        self.lane_offset = msg.data
+        self.last_lane_time = rospy.get_time()
 
-        angle, valid = self.detect_lane_angle(cv_img)
+    def offset_valid_callback(self, msg):
+        self.lane_offset_valid = msg.data
 
-        with self.lock:
-            if valid and np.isfinite(angle):
-                self.lane_angle_raw = float(angle)
-                self.have_lane_raw = True
-                self.last_lane_time = rospy.get_time()
-            else:
-                self.have_lane_raw = False
-
-            # Latch (hysteresis)
-            if self.have_lane_raw:
-                self.have_lane_latched = True
-            else:
-                if rospy.get_time() - self.last_lane_time > self.lane_ok_hold:
-                    self.have_lane_latched = False
-
-    # ---------------- Vision ----------------
-    def detect_lane_angle(self, bgr: np.ndarray) -> Tuple[float, bool]:
-        h, w = bgr.shape[:2]
-        roi_top = int(max(0, min(h - 1, h * float(self.roi_top_ratio))))
-        roi = bgr[roi_top:h, 0:w]
-
-        if roi.size == 0:
-            return 0.0, False
-
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blur, self.canny_lo, self.canny_hi)
-
-        lines = cv2.HoughLinesP(
-            edges, 1, np.pi / 180,
-            threshold=int(self.hough_thresh),
-            minLineLength=int(self.hough_min_len),
-            maxLineGap=int(self.hough_max_gap),
-        )
-        if lines is None:
-            return 0.0, False
-
-        angles = []
-        for l in lines:
-            x1, y1, x2, y2 = l[0]
-            dx = float(x2 - x1)
-            dy = float(y2 - y1)
-            if dx == 0.0 and dy == 0.0:
-                continue
-            ang = math.atan2(dy, dx)
-            # angle relative to vertical lane direction
-            angle_rel_vertical = normalize_angle((math.pi / 2.0) - ang)
-            # Reject near-horizontal segments (likely noise)
-            if abs(angle_rel_vertical) > math.radians(80):
-                continue
-            angles.append(angle_rel_vertical)
-
-        if not angles:
-            return 0.0, False
-
-        med = float(np.median(np.array(angles, dtype=np.float32)))
-        return med, True
-
-    # ---------------- TF & Path ----------------
-    def get_robot_pose(self) -> Optional[Tuple[float, float, float]]:
+    # ======================================
+    # TF Pose
+    # ======================================
+    def get_pose(self):
         try:
             now = rospy.Time(0)
-            self.tf_listener.waitForTransform(self.map_frame, self.base_frame, now, rospy.Duration(0.3))
-            (trans, rot) = self.tf_listener.lookupTransform(self.map_frame, self.base_frame, now)
+            self.tf_listener.waitForTransform(self.map_frame, self.base_frame,
+                                              now, rospy.Duration(0.3))
+            trans, rot = self.tf_listener.lookupTransform(self.map_frame,
+                                                          self.base_frame, now)
             x, y = trans[0], trans[1]
             yaw = tf.transformations.euler_from_quaternion(rot)[2]
-            if not all(np.isfinite([x, y, yaw])):
-                return None
             return x, y, yaw
-        except Exception as e:
-            rospy.logwarn_throttle(2.0, "TF lookup failed: %s", str(e))
+        except:
             return None
 
-    def compute_path_target_angle(self, robot_pose: Tuple[float, float, float]) -> Optional[float]:
+    # ======================================
+    # PATH Target Angle
+    # ======================================
+    def compute_path_angle(self, pose):
         with self.lock:
             path = self.current_path
-            last_time = self.last_path_time
+            last_t = self.last_path_time
 
         if path is None:
             return None
-        if rospy.get_time() - last_time > self.path_timeout:
+        if rospy.get_time() - last_t > self.path_timeout:
             return None
         if len(path.poses) == 0:
             return None
 
-        rx, ry, ryaw = robot_pose
+        rx, ry, ryaw = pose
 
-        current_speed_est = max(self.prev_lin, self.min_speed)
-        la = self.distance_ahead + (self.distance_ahead_hi - self.distance_ahead) * min(1.0, current_speed_est / max(self.max_speed, 1e-6))
+        v = max(self.prev_lin, self.min_speed)
+        la_ratio = min(1.0, v / max(self.max_speed, 1e-6))
+        la = self.distance_ahead + (self.distance_ahead_hi - self.distance_ahead) * la_ratio
 
-        best_pt = None
+        target_pt = None
         for ps in path.poses:
             px = ps.pose.position.x
             py = ps.pose.position.y
             if math.hypot(px - rx, py - ry) >= la:
-                best_pt = (px, py)
+                target_pt = (px, py)
                 break
-        if best_pt is None:
+
+        if target_pt is None:
             last = path.poses[-1].pose
-            best_pt = (last.position.x, last.position.y)
+            target_pt = (last.position.x, last.position.y)
 
-        tx, ty = best_pt
-        target_yaw = math.atan2(ty - ry, tx - rx)
-        err = normalize_angle(target_yaw - ryaw)
-        err = self.f_path.filt(err)
-        return err
+        tx, ty = target_pt
 
-    # ---------------- helpers ----------------
+        yaw_tgt = math.atan2(ty - ry, tx - rx)
+        err = normalize_angle(yaw_tgt - ryaw)
+
+        return self.f_path.filt(err)
+
+    # ======================================
+    # 작은 기능
+    # ======================================
     @staticmethod
-    def clamp(x: float, lo: float, hi: float) -> float:
+    def clamp(x, lo, hi):
         return min(hi, max(lo, x))
 
     @staticmethod
-    def rate_limit(prev: float, target: float, max_delta: float) -> float:
+    def rate_limit(prev, target, max_delta):
         if target > prev:
             return min(prev + max_delta, target)
         else:
             return max(prev - max_delta, target)
 
-    # ---------------- Main loop ----------------
+    # ======================================
+    # CONTROL LOOP
+    # ======================================
     def control_loop(self):
         rate = rospy.Rate(self.rate_hz)
-
-        # Small startup grace period for TF/Topics to come up
         rospy.sleep(0.25)
 
         while not rospy.is_shutdown():
-            now_t = rospy.Time.now().to_sec()
-            dt = max(1.0 / float(self.rate_hz), now_t - self.prev_t)
-            self.prev_t = now_t
+            now = rospy.Time.now().to_sec()
+            dt = max(1.0 / self.rate_hz, now - self.prev_t)
+            self.prev_t = now
 
-            pose = self.get_robot_pose()
+            pose = self.get_pose()
             tw = Twist()
 
             if pose is None:
-                target_lin = 0.0
-                target_ang = 0.0
+                tw.linear.x = 0.0
+                tw.angular.z = 0.0
+                self.cmd_pub.publish(tw)
+                continue
+
+            # -------- Path steering --------
+            path_ang = self.compute_path_angle(pose)
+            have_path = path_ang is not None
+
+            if have_path and abs(path_ang) < 0.02:
+                path_ang = 0.0
+
+            # -------- Lane steering (offset) --------
+            lane_ok = (rospy.get_time() - self.last_lane_time) <= self.lane_timeout and \
+                      self.lane_offset_valid
+
+            K_offset = 1.2
+
+            if lane_ok:
+                lane_steer = K_offset * self.lane_offset
             else:
-                path_ang = self.compute_path_target_angle(pose)
-                have_path = (path_ang is not None)
+                lane_steer = self.prev_steer  # 이전 값 유지
 
-                lane_age = rospy.get_time() - self.last_lane_time
-                lane_ok_now = (lane_age <= self.lane_detect_timeout) and self.have_lane_latched
+            # -------- Fusion --------
+            if have_path and lane_ok:
+                combined = self.alpha_lane * lane_steer + (1.0 - self.alpha_lane) * path_ang
+                base_speed = self.lane_speed
+            elif have_path:
+                combined = path_ang
+                base_speed = self.no_lane_speed
+            elif lane_ok:
+                combined = lane_steer
+                base_speed = self.lane_speed
+            else:
+                combined = 0.0
+                base_speed = 0.0 if self.stop_when_no_input else self.min_speed
 
-                # Compute filtered lane angle inside control loop (thread-safe)
-                with self.lock:
-                    lane_angle_f = self.f_lane.filt(self.lane_angle_raw) if lane_ok_now else self.f_lane.y
+            # deadzone
+            if abs(combined) < self.deadzone_angle:
+                combined = 0.0
 
-                # Fusion
-                if have_path and lane_ok_now:
-                    combined = (self.alpha_lane * lane_angle_f) + ((1.0 - self.alpha_lane) * path_ang)
-                    base_speed = self.lane_speed
-                elif have_path:
-                    combined = path_ang
-                    base_speed = max(self.no_lane_speed, self.min_speed)
-                elif lane_ok_now:
-                    combined = lane_angle_f
-                    base_speed = max(self.lane_speed, self.min_speed)
-                else:
-                    combined = 0.0
-                    base_speed = 0.0 if self.stop_when_no_input else self.min_speed
+            # steering filtering + rate limit
+            steer_raw = self.f_steer.filt(combined)
+            max_dsteer = self.max_steer_rate * dt
+            steer = self.rate_limit(self.prev_steer, steer_raw, max_dsteer)
+            self.prev_steer = steer
 
-                if abs(combined) < self.deadzone_angle:
-                    combined = 0.0
+            # turn slowdown
+            turn_scale = 1.0 / (1.0 + self.turn_slowdown_k * (abs(steer) ** 1.2))
+            target_lin = self.clamp(base_speed * turn_scale, 0.0, self.max_speed)
 
-                steer = self.f_steer.filt(combined)
+            # steer → angular velocity
+            target_ang = self.clamp(-steer, -self.max_ang, self.max_ang)
 
-                # Turn-dependent slowdown
-                turn_scale = 1.0 / (1.0 + self.turn_slowdown_k * (abs(steer) ** 1.2))
-                target_lin = self.clamp(base_speed * turn_scale, 0.0, self.max_speed)
-
-                # Simple proportional steering -> angular vel
-                k_ang = 1.0
-                target_ang = self.clamp(-k_ang * steer, -self.max_ang, self.max_ang)
-
-            # Accel / decel limiting
+            # acceleration limits
             max_dv = (self.max_lin_acc if target_lin >= self.prev_lin else self.max_lin_dec) * dt
             cmd_lin = self.rate_limit(self.prev_lin, target_lin, max_dv)
 
-            # Angular rate limiting
-            max_dw = self.max_ang_rate * dt
-            cmd_ang = self.rate_limit(self.prev_ang, target_ang, max_dw)
+            # angular rate limit
+            cmd_ang = self.rate_limit(self.prev_ang, target_ang, self.max_ang_rate * dt)
 
-            # Speed smoothing
+            # smoothing
             cmd_lin = self.f_speed.filt(cmd_lin)
 
-            tw.linear.x = self.clamp(cmd_lin, 0.0, self.max_speed)
-            tw.angular.z = self.clamp(cmd_ang, -self.max_ang, self.max_ang)
+            tw.linear.x = cmd_lin
+            tw.angular.z = cmd_ang
 
             self.cmd_pub.publish(tw)
 
-            self.prev_lin = tw.linear.x
-            self.prev_ang = tw.angular.z
+            self.prev_lin = cmd_lin
+            self.prev_ang = cmd_ang
 
             rate.sleep()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         node = SlamLkasFusion()
         node.control_loop()

@@ -1,0 +1,20 @@
+<launch>
+  <!-- BEV 차선 중앙 검출 -->
+  <node pkg="limo_slam_lkas"
+        type="lane_center_bev.py"
+        name="lane_center_bev"
+        output="screen">
+    <param name="image_topic" value="/camera/rgb/image_raw" />
+  </node>
+
+  <!-- SLAM + LKAS Fusion -->
+  <node pkg="limo_slam_lkas"
+        type="slam_lkas_fusion.py"
+        name="slam_lkas_fusion"
+        output="screen">
+    <param name="path_topic" value="/move_base/GlobalPlanner/plan" />
+    <param name="cmd_topic"  value="/cmd_vel" />
+    <param name="base_frame" value="base_link" />
+    <param name="map_frame"  value="map" />
+  </node>
+</launch>

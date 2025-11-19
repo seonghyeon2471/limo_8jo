@@ -1,0 +1,141 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import rospy
+import cv2
+import numpy as np
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Path
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+
+
+class FusionLkasFinal(object):
+    def __init__(self):
+        rospy.init_node("fusion_lkas_final")
+
+        # Subscribers
+        rospy.Subscriber("/camera/rgb/image_raw", Image, self.image_cb)
+        rospy.Subscriber("/move_base/NavfnROS/plan", Path, self.path_cb)
+
+        # Publisher
+        self.cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+
+        # Utils
+        self.bridge = CvBridge()
+
+        # Control parameters
+        self.base_speed = 0.20
+        self.alpha_lkas = 0.40
+        self.max_ang = 0.8
+
+        # State flags
+        self.goal_active = False
+
+        # Buffers
+        self.slam_ang = 0.0
+        self.lkas_ang = 0.0
+
+        # Bird-eye matrix cache
+        self.M_bev = None
+
+    # ======================================
+    def path_cb(self, msg):
+        if len(msg.poses) < 2:
+            self.goal_active = False
+            return
+
+        self.goal_active = True
+
+        p0 = msg.poses[0].pose.position
+        p1 = msg.poses[1].pose.position
+
+        dx = p1.x - p0.x
+        dy = p1.y - p0.y
+
+        self.slam_ang = np.arctan2(dy, dx)
+
+    # ======================================
+    def bird_eye(self, img):
+        h, w = img.shape[:2]
+
+        if self.M_bev is None:
+            src = np.float32([
+                [w * 0.2, h * 0.6],
+                [w * 0.8, h * 0.6],
+                [0,       h * 1.0],
+                [w * 1.0, h * 1.0]
+            ])
+
+            dst = np.float32([
+                [0, 0],
+                [w, 0],
+                [0, h],
+                [w, h]
+            ])
+
+            self.M_bev = cv2.getPerspectiveTransform(src, dst)
+
+        return cv2.warpPerspective(img, self.M_bev, (w, h))
+
+    # ======================================
+    def yellow_mask(self, img):
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        lower_y = np.array([15, 60, 60], dtype=np.uint8)
+        upper_y = np.array([35, 255, 255], dtype=np.uint8)
+        return cv2.inRange(hsv, lower_y, upper_y)
+
+    # ======================================
+    def calc_lane_center(self, bin_img):
+        h, w = bin_img.shape
+
+        hist = np.sum(bin_img[h//2:, :], axis=0)
+        peak = np.argmax(hist)
+
+        # No yellow line found
+        if hist[peak] < 5000:
+            return None
+
+        img_center = w / 2.0
+        offset = (img_center - peak) / (w / 2.0)
+        return offset
+
+    # ======================================
+    def image_cb(self, msg):
+        frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+
+        # Bird-eye
+        bev = self.bird_eye(frame)
+
+        # Yellow mask
+        bin_yellow = self.yellow_mask(bev)
+
+        # Lane offset
+        offset = self.calc_lane_center(bin_yellow)
+
+        if offset is None:
+            lkas_ang = 0.0
+        else:
+            lkas_ang = -offset * 0.7
+            lkas_ang = max(-self.max_ang, min(self.max_ang, lkas_ang))
+
+        self.lkas_ang = lkas_ang
+
+        # ===== Goal 없으면 정지 =====
+        if not self.goal_active:
+            self.cmd_pub.publish(Twist())
+            return
+
+        # ===== SLAM + LKAS 융합 =====
+        ang = (1 - self.alpha_lkas) * self.slam_ang + self.alpha_lkas * self.lkas_ang
+
+        cmd = Twist()
+        cmd.linear.x = self.base_speed
+        cmd.angular.z = ang
+
+        self.cmd_pub.publish(cmd)
+
+
+if __name__ == "__main__":
+    FusionLkasFinal()
+    rospy.spin()

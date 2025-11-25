@@ -1,0 +1,172 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+LKAS + SLAM Guard (제자리 회전 버전)
+- SLAM(cmd_vel_slam) 따라감
+- LKAS offset ≥ depart_threshold 이면:
+      1) STOP
+      2) 제자리에서 angular.z = gain * offset
+- offset ≤ clear_threshold 이면:
+      → SLAM 명령으로 복귀
+"""
+
+import rospy
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float32, Bool
+import threading
+
+
+class EWMA(object):
+    def __init__(self, alpha=0.6, init_val=0.0):
+        self.a = float(alpha)
+        self.y = float(init_val)
+        self.initialized = False
+
+    def reset(self, v=0.0):
+        self.y = float(v)
+        self.initialized = True
+
+    def filt(self, x):
+        x = float(x)
+        if not self.initialized:
+            self.reset(x)
+        self.y = self.a * self.y + (1.0 - self.a) * x
+        return self.y
+
+
+class LkasSlamGuard(object):
+    def __init__(self):
+        rospy.init_node("lkas_slam_guard")
+
+        # ===== PARAMETERS =====
+        self.rate_hz = rospy.get_param("~rate", 20)
+
+        self.slam_cmd_topic = rospy.get_param("~slam_cmd_topic", "/cmd_vel_slam")
+        self.out_cmd_topic  = rospy.get_param("~out_cmd_topic",  "/cmd_vel")
+
+        self.depart_threshold = rospy.get_param("~depart_threshold", 0.25)
+        self.clear_threshold  = rospy.get_param("~clear_threshold",  0.15)
+
+        self.lane_gain = rospy.get_param("~lane_gain", 1.2)
+        self.max_ang   = rospy.get_param("~max_ang",   1.2)
+        self.deadzone  = rospy.get_param("~deadzone",  0.05)
+
+        self.slam_timeout = rospy.get_param("~slam_timeout", 0.5)
+        self.lane_timeout = rospy.get_param("~lane_timeout", 0.5)
+
+        # ===== STATE =====
+        self.lock = threading.RLock()
+        self.last_slam_cmd = Twist()
+        self.last_slam_time = 0.0
+
+        self.lane_offset = 0.0
+        self.lane_valid = False
+        self.last_lane_time = 0.0
+
+        self.in_override = False
+
+        self.f_ang = EWMA(alpha=0.6, init_val=0.0)
+
+        # ===== ROS IO =====
+        self.pub_cmd = rospy.Publisher(self.out_cmd_topic, Twist, queue_size=1)
+        rospy.Subscriber(self.slam_cmd_topic, Twist, self.cb_slam)
+        rospy.Subscriber("/lane_center_offset", Float32, self.cb_offset)
+        rospy.Subscriber("/lane_center_valid",  Bool,    self.cb_valid)
+
+        rospy.loginfo("[LKAS_GUARD] READY (제자리 조향 버전)")
+
+        self.spin()
+
+    # =================================
+    # CALLBACKS
+    # =================================
+    def cb_slam(self, msg):
+        with self.lock:
+            self.last_slam_cmd = msg
+            self.last_slam_time = rospy.get_time()
+
+    def cb_offset(self, msg):
+        self.lane_offset = msg.data
+        self.last_lane_time = rospy.get_time()
+
+    def cb_valid(self, msg):
+        self.lane_valid = msg.data
+
+    # =================================
+    # MAIN LOOP
+    # =================================
+    def spin(self):
+        r = rospy.Rate(self.rate_hz)
+
+        while not rospy.is_shutdown():
+            now = rospy.get_time()
+
+            with self.lock:
+                slam = self.last_slam_cmd
+                age_slam = now - self.last_slam_time
+                age_lane = now - self.last_lane_time
+
+            cmd = Twist()
+
+            # -------------------------------------
+            # 1) SLAM 명령 없으면 정지
+            # -------------------------------------
+            if age_slam > self.slam_timeout:
+                self.in_override = False
+                self.pub_cmd.publish(cmd)
+                r.sleep()
+                continue
+
+            # 기본 주행 = SLAM
+            cmd = slam
+
+            # -------------------------------------
+            # 2) LKAS 유효 여부 계산
+            # -------------------------------------
+            lane_ok = (age_lane <= self.lane_timeout) and self.lane_valid
+            offset = self.lane_offset
+
+            # 이탈 여부 판정
+            if lane_ok:
+                if abs(offset) >= self.depart_threshold:
+                    self.in_override = True
+                elif abs(offset) <= self.clear_threshold:
+                    self.in_override = False
+            else:
+                self.in_override = False
+
+            # -------------------------------------
+            # 3) OVERRIDE 동작 (제자리 회전)
+            # -------------------------------------
+            if self.in_override and lane_ok:
+
+                # == 즉시 STOP ==
+                cmd.linear.x = 0.0
+
+                # == 제자리 회전 ==
+                ang = self.lane_gain * offset
+
+                if abs(ang) < self.deadzone:
+                    ang = 0.0
+
+                ang = max(-self.max_ang, min(self.max_ang, ang))
+                ang = self.f_ang.filt(ang)
+
+                cmd.angular.z = ang
+
+                self.pub_cmd.publish(cmd)
+                r.sleep()
+                continue
+
+            # -------------------------------------
+            # 4) 정상 주행 (SLAM + 필터)
+            # -------------------------------------
+            cmd.angular.z = self.f_ang.filt(cmd.angular.z)
+
+            self.pub_cmd.publish(cmd)
+            r.sleep()
+
+
+if __name__ == "__main__":
+    LkasSlamGuard()

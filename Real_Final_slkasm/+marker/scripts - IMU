@@ -1,0 +1,145 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+IMU 기반 부드러운 속도 제어 노드
+
+- 입력:  /cmd_vel_in  (다른 노드에서 나온 원래 속도 명령)
+- 출력:  /cmd_vel_out (IMU 고려해서 부드럽게 만든 최종 속도)
+- IMU:   /imu/data    (LIMO 내장 IMU)
+
+기능:
+  1) 선속도(linear.x)에 가속도 제한 걸어서 서서히 변화
+  2) 피치축 각속도(angular_velocity.y) 스파이크를 이용해 방지턱 감지
+  3) 방지턱 구간에서는 선속도 상한을 bump_speed로 제한해서 살살 넘어감
+"""
+
+import rospy
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Imu
+
+
+class ImuSoftController(object):
+    def __init__(self):
+        rospy.init_node("imu_soft_controller")
+
+        # ========= 파라미터 =========
+        self.cmd_in_topic  = rospy.get_param("~cmd_in_topic",  "/cmd_vel_in")
+        self.cmd_out_topic = rospy.get_param("~cmd_out_topic", "/cmd_vel_out")
+        self.imu_topic     = rospy.get_param("~imu_topic",     "/imu/data")
+
+        self.rate_hz   = rospy.get_param("~rate", 30.0)
+
+        # 가속/감속 한계 (m/s^2)
+        self.max_accel = rospy.get_param("~max_accel", 0.4)
+        self.max_decel = rospy.get_param("~max_decel", 0.6)
+
+        # 명령이 일정 시간 이상 안 들어오면 정지
+        self.cmd_timeout = rospy.get_param("~cmd_timeout", 0.5)  # [s]
+
+        # 방지턱 관련
+        self.gyro_y_thresh = rospy.get_param("~gyro_y_thresh", 1.5)  # [rad/s]
+        self.bump_speed    = rospy.get_param("~bump_speed", 0.08)     # [m/s]
+        self.bump_hold     = rospy.get_param("~bump_hold", 2.0)       # [s] 유지 시간
+        self.bump_min_interval = rospy.get_param("~bump_min_interval", 1.0)  # [s] 최소 간격
+
+        # ========= 상태 변수 =========
+        self.last_raw_cmd = Twist()
+        self.last_cmd_time = rospy.Time.now().to_sec()
+
+        self.current_v = 0.0     # 실제로 내보내는 선속도
+        self.last_out_time = rospy.Time.now().to_sec()
+
+        self.gyro_y = 0.0
+        self.bump_active = False
+        self.last_bump_time = 0.0
+
+        # ========= ROS I/O =========
+        self.pub_cmd = rospy.Publisher(self.cmd_out_topic, Twist, queue_size=1)
+        rospy.Subscriber(self.cmd_in_topic, Twist, self.cb_cmd_raw)
+        rospy.Subscriber(self.imu_topic, Imu, self.cb_imu)
+
+        rospy.loginfo("[IMU_SOFT] in: %s  out: %s  imu: %s",
+                      self.cmd_in_topic, self.cmd_out_topic, self.imu_topic)
+
+        self.loop()
+
+    # ----- 콜백들 -----
+    def cb_cmd_raw(self, msg):
+        self.last_raw_cmd = msg
+        self.last_cmd_time = rospy.Time.now().to_sec()
+
+    def cb_imu(self, msg):
+        """IMU로부터 피치축 각속도(gyro_y) 읽고 방지턱 감지."""
+        self.gyro_y = msg.angular_velocity.y
+        now = rospy.Time.now().to_sec()
+
+        # threshold 넘으면 bump 후보
+        if abs(self.gyro_y) > self.gyro_y_thresh:
+            # 최소 간격 지나야 새 bump로 인정
+            if (now - self.last_bump_time) > self.bump_min_interval:
+                rospy.loginfo("[IMU_SOFT] Bump detected! gyro_y=%.3f", self.gyro_y)
+                self.last_bump_time = now
+                self.bump_active = True
+
+        # bump 유지시간 지나면 종료
+        if self.bump_active and (now - self.last_bump_time) > self.bump_hold:
+            rospy.loginfo("[IMU_SOFT] Bump phase end")
+            self.bump_active = False
+
+    # ----- 메인 루프 -----
+    def loop(self):
+        rate = rospy.Rate(self.rate_hz)
+        while not rospy.is_shutdown():
+            now = rospy.Time.now().to_sec()
+
+            # 1) 타겟 속도 결정
+            age_cmd = now - self.last_cmd_time
+            if age_cmd > self.cmd_timeout:
+                # 명령 오래 안 들어오면 정지
+                v_target = 0.0
+                raw_cmd = Twist()
+            else:
+                raw_cmd = self.last_raw_cmd
+                v_target = raw_cmd.linear.x
+
+            # 2) 방지턱 구간이면 속도 상한 제한
+            if self.bump_active and v_target > self.bump_speed:
+                v_target = self.bump_speed
+
+            # 3) 가속도 제한 적용
+            dt = now - self.last_out_time
+            if dt <= 0.0:
+                dt = 1.0 / self.rate_hz
+
+            dv = v_target - self.current_v
+            max_up = self.max_accel * dt
+            max_dn = self.max_decel * dt
+
+            if dv > max_up:
+                dv = max_up
+            elif dv < -max_dn:
+                dv = -max_dn
+
+            self.current_v += dv
+
+            # 4) 최종 명령 구성 및 publish
+            out = Twist()
+            out.linear.x  = self.current_v
+            out.linear.y  = raw_cmd.linear.y
+            out.linear.z  = raw_cmd.linear.z
+            out.angular.x = raw_cmd.angular.x
+            out.angular.y = raw_cmd.angular.y
+            out.angular.z = raw_cmd.angular.z
+
+            self.pub_cmd.publish(out)
+            self.last_out_time = now
+
+            rate.sleep()
+
+
+if __name__ == "__main__":
+    try:
+        ImuSoftController()
+    except rospy.ROSInterruptException:
+        pass

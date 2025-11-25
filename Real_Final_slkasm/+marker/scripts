@@ -1,0 +1,230 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+LKAS + SLAM Guard + Marker Stop (ID 0 → 3s, ID 4 → 5s)
+- SLAM(cmd_vel_slam) 따라감
+- LKAS offset ≥ depart_threshold → 제자리 회전
+- AR 마커(ID=0,4) 인식 시 강제 정지 + 재발동 방지 쿨다운 포함
+"""
+
+import rospy
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float32, Bool
+from ar_track_alvar_msgs.msg import AlvarMarkers   # ★ 마커 패키지
+import threading
+
+
+class EWMA(object):
+    def __init__(self, alpha=0.6, init_val=0.0):
+        self.a = float(alpha)
+        self.y = float(init_val)
+        self.initialized = False
+
+    def reset(self, v=0.0):
+        self.y = float(v)
+        self.initialized = True
+
+    def filt(self, x):
+        x = float(x)
+        if not self.initialized:
+            self.reset(x)
+        self.y = self.a * self.y + (1.0 - self.a) * x
+        return self.y
+
+
+class LkasSlamGuard(object):
+    def __init__(self):
+        rospy.init_node("lkas_slam_guard")
+
+        # ===== PARAMETERS =====
+        self.rate_hz = rospy.get_param("~rate", 20)
+
+        self.slam_cmd_topic = rospy.get_param("~slam_cmd_topic", "/cmd_vel_slam")
+        self.out_cmd_topic  = rospy.get_param("~out_cmd_topic",  "/cmd_vel")
+
+        self.depart_threshold = rospy.get_param("~depart_threshold", 0.25)
+        self.clear_threshold  = rospy.get_param("~clear_threshold",  0.15)
+
+        self.lane_gain = rospy.get_param("~lane_gain", 1.2)
+        self.max_ang   = rospy.get_param("~max_ang",   1.2)
+        self.deadzone  = rospy.get_param("~deadzone",  0.05)
+
+        self.slam_timeout = rospy.get_param("~slam_timeout", 0.5)
+        self.lane_timeout = rospy.get_param("~lane_timeout", 0.5)
+
+        # ===== STATE =====
+        self.lock = threading.RLock()
+        self.last_slam_cmd = Twist()
+        self.last_slam_time = 0.0
+
+        self.lane_offset = 0.0
+        self.lane_valid = False
+        self.last_lane_time = 0.0
+
+        self.in_override = False
+
+        self.f_ang = EWMA(alpha=0.6, init_val=0.0)
+
+        # ===== MARKER STOP STATE =====
+        self.is_stopping = False
+        self.stop_until = rospy.Time(0)
+
+        # 마커별 쿨다운(ID 0, 4)
+        self.cooldown_until = {0: rospy.Time(0), 4: rospy.Time(0)}
+
+        # ===== ROS IO =====
+        self.pub_cmd = rospy.Publisher(self.out_cmd_topic, Twist, queue_size=1)
+        rospy.Subscriber(self.slam_cmd_topic, Twist, self.cb_slam)
+        rospy.Subscriber("/lane_center_offset", Float32, self.cb_offset)
+        rospy.Subscriber("/lane_center_valid",  Bool,    self.cb_valid)
+        rospy.Subscriber("/ar_pose_marker", AlvarMarkers, self.cb_marker)  # ★ 추가
+
+        rospy.loginfo("[LKAS_GUARD] READY + Marker Stop Enabled")
+
+        self.spin()
+
+    # =================================
+    # CALLBACKS
+    # =================================
+    def cb_slam(self, msg):
+        with self.lock:
+            self.last_slam_cmd = msg
+            self.last_slam_time = rospy.get_time()
+
+    def cb_offset(self, msg):
+        self.lane_offset = msg.data
+        self.last_lane_time = rospy.get_time()
+
+    def cb_valid(self, msg):
+        self.lane_valid = msg.data
+
+    # =================================
+    # 📌 Marker callback
+    # =================================
+    def cb_marker(self, msg):
+
+        # 이미 정지 중이면 무시 (무한정 멈춤 방지)
+        if self.is_stopping:
+            return
+
+        if len(msg.markers) == 0:
+            return
+
+        now = rospy.Time.now()
+
+        for m in msg.markers:
+            mid = m.id
+
+            # 관심 ID
+            if mid not in [0, 4]:
+                continue
+
+            # 쿨다운 중이면 무시
+            if now < self.cooldown_until[mid]:
+                continue
+
+            # ---- ID 0번: 3초 정지 ----
+            if mid == 0:
+                rospy.loginfo("[AR Marker] ID 0 detected → Stop 3 sec")
+                self.stop_until = now + rospy.Duration(3.0)
+                self.is_stopping = True
+                self.cooldown_until[0] = now + rospy.Duration(7.0)  # 정지 3 + 쿨다운 4
+                return
+
+            # ---- ID 4번: 5초 정지 ----
+            if mid == 4:
+                rospy.loginfo("[AR Marker] ID 4 detected → Stop 5 sec")
+                self.stop_until = now + rospy.Duration(5.0)
+                self.is_stopping = True
+                self.cooldown_until[4] = now + rospy.Duration(11.0)  # 정지 5 + 쿨다운 6
+                return
+
+    # =================================
+    # MAIN LOOP
+    # =================================
+    def spin(self):
+        r = rospy.Rate(self.rate_hz)
+
+        while not rospy.is_shutdown():
+            now = rospy.get_time()
+
+            # ---------------------------
+            # 🚨 1) 마커 정지 우선
+            # ---------------------------
+            if rospy.Time.now() < self.stop_until:
+                stop = Twist()
+                stop.linear.x = 0.0
+                stop.angular.z = 0.0
+                self.pub_cmd.publish(stop)
+                r.sleep()
+                continue
+
+            # 정지 끝나면 풀기
+            if self.is_stopping and rospy.Time.now() >= self.stop_until:
+                rospy.loginfo("[Marker] Stop finished → Resume")
+                self.is_stopping = False
+
+            # ---------------------------
+            # 2) SLAM timeout → STOP
+            # ---------------------------
+            with self.lock:
+                slam = self.last_slam_cmd
+                age_slam = now - self.last_slam_time
+                age_lane = now - self.last_lane_time
+
+            cmd = Twist()
+
+            if age_slam > self.slam_timeout:
+                self.in_override = False
+                self.pub_cmd.publish(cmd)
+                r.sleep()
+                continue
+
+            # 기본 = SLAM
+            cmd = slam
+
+            # ---------------------------
+            # 3) LKAS 판단
+            # ---------------------------
+            lane_ok = (age_lane <= self.lane_timeout) and self.lane_valid
+            offset = self.lane_offset
+
+            if lane_ok:
+                if abs(offset) >= self.depart_threshold:
+                    self.in_override = True
+                elif abs(offset) <= self.clear_threshold:
+                    self.in_override = False
+            else:
+                self.in_override = False
+
+            # ---------------------------
+            # 4) LKAS Override
+            # ---------------------------
+            if self.in_override and lane_ok:
+
+                cmd.linear.x = 0.0  # 즉시 정지
+
+                ang = self.lane_gain * offset
+                if abs(ang) < self.deadzone:
+                    ang = 0.0
+
+                ang = max(-self.max_ang, min(self.max_ang, ang))
+                ang = self.f_ang.filt(ang)
+
+                cmd.angular.z = ang
+
+                self.pub_cmd.publish(cmd)
+                r.sleep()
+                continue
+
+            # ---------------------------
+            # 5) 정상 SLAM 주행
+            # ---------------------------
+            cmd.angular.z = self.f_ang.filt(cmd.angular.z)
+            self.pub_cmd.publish(cmd)
+            r.sleep()
+
+
+if __name__ == "__main__":
+    LkasSlamGuard()

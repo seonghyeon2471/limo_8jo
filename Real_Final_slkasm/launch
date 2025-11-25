@@ -1,0 +1,57 @@
+<launch>
+
+  <!-- ========================================================= -->
+  <!-- 1) LKAS - BEV 기반 차선 중앙 검출                         -->
+  <!-- ========================================================= -->
+  <node pkg="limo_slam_lkas"
+        type="lane_center_bev.py"
+        name="lane_center_bev"
+        output="screen">
+
+      <param name="image_topic" value="/camera/rgb/image_raw" />
+
+  </node>
+
+
+
+  <!-- ========================================================= -->
+  <!-- 2) SLAM + LKAS Override Guard (최종 /cmd_vel 생성)        -->
+  <!-- ========================================================= -->
+  <node pkg="limo_slam_lkas"
+        type="lkas_slam_guard.py"
+        name="lkas_slam_guard"
+        output="screen">
+
+      <!-- SLAM이 최종 cmd_vel 내보내는 토픽 (remap 필요) -->
+      <param name="slam_cmd_topic" value="/cmd_vel_slam" />
+
+      <!-- 로봇이 실제로 구동하는 명령 -->
+      <param name="out_cmd_topic"  value="/cmd_vel" />
+
+      <!-- SLAM path (local plan 사용 권장) -->
+      <param name="path_topic" value="/move_base/TrajectoryPlannerROS/local_plan" />
+
+      <!-- TF frame -->
+      <param name="base_frame" value="base_link" />
+
+      <!-- LKAS 이탈/복귀 판단 기준 -->
+      <param name="depart_threshold" value="0.30" />
+      <param name="clear_threshold"  value="0.18" />
+
+      <!-- 조향 게인 및 제한값 -->
+      <param name="yaw_gain"  value="1.2" />
+      <param name="max_ang"   value="1.0" />
+      <param name="deadzone" value="0.05" />
+
+      <!-- path 검색 lookahead 범위 -->
+      <param name="lookahead_min" value="0.30" />
+      <param name="lookahead_max" value="0.80" />
+
+      <!-- timeouts -->
+      <param name="slam_timeout" value="0.5" />
+      <param name="lane_timeout" value="0.5" />
+      <param name="path_timeout" value="0.7" />
+
+  </node>
+
+</launch>

@@ -49,7 +49,7 @@ class LkasSlamGuard(object):
         self.clear_threshold  = rospy.get_param("~clear_threshold",  0.15)
 
         self.lane_gain = rospy.get_param("~lane_gain", 1.2)
-        self.max_ang   = rospy.get_param("~max_ang",   1.2)
+        self.max_ang   = rospy.get_param("~max_ang",   0.9)
         self.deadzone  = rospy.get_param("~deadzone",  0.05)
 
         self.slam_timeout = rospy.get_param("~slam_timeout", 0.5)

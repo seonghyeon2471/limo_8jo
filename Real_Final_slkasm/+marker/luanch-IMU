@@ -1,0 +1,118 @@
+<launch>
+
+  <!-- ========================================================= -->
+  <!-- 1) LIMO 본체 (모터/IMU/TF/기본 bringup)                   -->
+  <!-- ========================================================= -->
+  <include file="$(find limo_bringup)/launch/limo_start.launch">
+    <arg name="pub_odom_tf" value="false"/>
+  </include>
+
+  <!-- ========================================================= -->
+  <!-- 2) Astra RGB 카메라 실행 (dabai_u3.launch)               -->
+  <!-- ========================================================= -->
+  <include file="$(find astra_camera)/launch/dabai_u3.launch"/>
+
+  <!-- ========================================================= -->
+  <!-- 3) LiDAR 기반 Navigation 실행                             -->
+  <!-- ========================================================= -->
+  <include file="$(find limo_bringup)/launch/limo_navigation_diff.launch"/>
+
+  <!-- ========================================================= -->
+  <!-- 4) AR TRACK ALVAR                                         -->
+  <!-- ========================================================= -->
+  <node pkg="ar_track_alvar"
+        type="individualMarkersNoKinect"
+        name="ar_track_alvar"
+        output="screen">
+
+    <remap from="camera_image" to="/camera/rgb/image_raw"/>
+    <remap from="camera_info"  to="/camera/rgb/camera_info"/>
+
+    <param name="output_frame" value="camera_rgb_optical_frame"/>
+    <param name="marker_size" value="12.0"/>
+
+    <param name="max_new_marker_error" value="0.25"/>
+    <param name="max_track_error" value="0.20"/>
+    <param name="min_confidence" value="0.001"/>
+
+  </node>
+
+  <!-- ========================================================= -->
+  <!-- 5) LKAS — BEV 기반 차선 중앙 검출                        -->
+  <!-- ========================================================= -->
+  <node pkg="limo_slam_lkas"
+        type="lane_center_bev.py"
+        name="lane_center_bev"
+        output="screen">
+    <param name="image_topic" value="/camera/rgb/image_raw" />
+  </node>
+
+  <!-- ========================================================= -->
+  <!-- 6) SLAM + LKAS Override Guard (최종 제어 원본 → /cmd_vel_raw) -->
+  <!-- ========================================================= -->
+  <node pkg="limo_slam_lkas"
+        type="lkas_slam_guard.py"
+        name="lkas_slam_guard"
+        output="screen">
+
+    <param name="slam_cmd_topic" value="/cmd_vel_slam" />
+    <!-- ★ 최종 명령을 바로 /cmd_vel로 안 보내고, IMU가 받을 /cmd_vel_raw로 보냄 -->
+    <param name="out_cmd_topic"  value="/cmd_vel_raw" />
+
+    <param name="path_topic" value="/move_base/TrajectoryPlannerROS/local_plan" />
+    <param name="base_frame" value="base_link" />
+
+    <param name="depart_threshold" value="0.30" />
+    <param name="clear_threshold"  value="0.18" />
+
+    <param name="yaw_gain"  value="1.2" />
+    <param name="max_ang"   value="1.0" />
+    <param name="deadzone"  value="0.05" />
+
+    <param name="lookahead_min" value="0.30" />
+    <param name="lookahead_max" value="0.80" />
+
+    <param name="slam_timeout" value="0.5" />
+    <param name="lane_timeout" value="0.5" />
+    <param name="path_timeout" value="0.7" />
+
+  </node>
+
+  <!-- ========================================================= -->
+  <!-- 7) IMU 기반 부드러운 방지턱 통과/속도제어 노드           -->
+  <!-- ========================================================= -->
+  <node pkg="limo_slam_lkas"
+        type="imu_soft_controller.py"
+        name="imu_soft_controller"
+        output="screen">
+
+    <!-- LKAS+SLAM+마커에서 나온 원래 속도 -->
+    <param name="cmd_in_topic"  value="/cmd_vel_raw" />
+    <!-- 실제 로봇에 들어갈 최종 속도 -->
+    <param name="cmd_out_topic" value="/cmd_vel" />
+
+    <!-- LIMO 내장 IMU 토픽 (limo_start에서 올라옴) -->
+    <param name="imu_topic" value="/imu/data" />
+
+    <!-- 가속/감속 제한 (부드러운 출발/감속) -->
+    <param name="max_accel" value="0.4" />
+    <param name="max_decel" value="0.6" />
+
+    <!-- 방지턱 감지: 피치각속도 기준 threshold -->
+    <param name="gyro_y_thresh" value="1.5" />
+
+    <!-- 방지턱 구간에서 최대 속도 (살살 넘기) -->
+    <param name="bump_speed" value="0.08" />
+
+    <!-- bump 감지 후 이 시간 동안 저속 유지 -->
+    <param name="bump_hold" value="2.0" />
+
+    <!-- 연속 bump로 잘못 인식하지 않기 위한 최소 간격 -->
+    <param name="bump_min_interval" value="1.0" />
+
+    <!-- 명령 끊기면 강제 정지 -->
+    <param name="cmd_timeout" value="0.5" />
+
+  </node>
+
+</launch>

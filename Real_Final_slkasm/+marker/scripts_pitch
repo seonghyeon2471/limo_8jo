@@ -1,0 +1,245 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+LKAS + SLAM Guard (제자리 회전 + 피치 기반 감속)
+- SLAM(cmd_vel_slam) 따라감
+- LKAS offset ≥ depart_threshold 이면:
+      1) STOP
+      2) 제자리에서 angular.z = gain * offset
+- offset ≤ clear_threshold 이면:
+      → SLAM 명령으로 복귀
+- IMU 기반 pitch 변화가 커지면:
+      → linear.x 를 자동 감속
+"""
+
+import rospy
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float32, Bool
+from sensor_msgs.msg import Imu       # <<< 추가
+import threading
+import math                           # <<< 추가
+
+
+class EWMA(object):
+    def __init__(self, alpha=0.6, init_val=0.0):
+        self.a = float(alpha)
+        self.y = float(init_val)
+        self.initialized = False
+
+    def reset(self, v=0.0):
+        self.y = float(v)
+        self.initialized = True
+
+    def filt(self, x):
+        x = float(x)
+        if not self.initialized:
+            self.reset(x)
+        self.y = self.a * self.y + (1.0 - self.a) * x
+        return self.y
+
+
+class LkasSlamGuard(object):
+    def __init__(self):
+        rospy.init_node("lkas_slam_guard")
+
+        # ===== PARAMETERS =====
+        self.rate_hz = rospy.get_param("~rate", 20)
+
+        self.slam_cmd_topic = rospy.get_param("~slam_cmd_topic", "/cmd_vel_slam")
+        self.out_cmd_topic  = rospy.get_param("~out_cmd_topic",  "/cmd_vel")
+
+        self.depart_threshold = rospy.get_param("~depart_threshold", 0.25)
+        self.clear_threshold  = rospy.get_param("~clear_threshold",  0.15)
+
+        self.lane_gain = rospy.get_param("~lane_gain", 1.2)
+        self.max_ang   = rospy.get_param("~max_ang",   0.9)
+        self.deadzone  = rospy.get_param("~deadzone",  0.05)
+
+        self.slam_timeout = rospy.get_param("~slam_timeout", 0.5)
+        self.lane_timeout = rospy.get_param("~lane_timeout", 0.5)
+
+        # ===== IMU / PITCH 관련 파라미터 =====
+        # pitch 기준값에서 몇 도 이상부터 감속 시작할지
+        self.pitch_slow_start_deg = rospy.get_param("~pitch_slow_start_deg", 4.0)
+        # 이 값 이상이면 최소 속도 비율까지 감속
+        self.pitch_slow_full_deg  = rospy.get_param("~pitch_slow_full_deg", 8.0)
+        # 감속 시 최소 속도 비율 (예: 0.3 -> 원래 속도의 30%까지 줄임)
+        self.pitch_min_speed_scale = rospy.get_param("~pitch_min_speed_scale", 0.3)
+        # IMU 타임아웃
+        self.imu_timeout = rospy.get_param("~imu_timeout", 0.5)
+
+        # ===== STATE =====
+        self.lock = threading.RLock()
+        self.last_slam_cmd = Twist()
+        self.last_slam_time = 0.0
+
+        self.lane_offset = 0.0
+        self.lane_valid = False
+        self.last_lane_time = 0.0
+
+        self.in_override = False
+
+        self.f_ang = EWMA(alpha=0.6, init_val=0.0)
+
+        # ===== IMU 상태 =====
+        self.pitch_deg = 0.0         # 현재 pitch (deg)
+        self.pitch_ref = None        # 평지 기준 pitch (deg)
+        self.last_imu_time = 0.0
+        self.f_pitch = EWMA(alpha=0.5, init_val=0.0)  # pitch 필터
+
+        # ===== ROS IO =====
+        self.pub_cmd = rospy.Publisher(self.out_cmd_topic, Twist, queue_size=1)
+        rospy.Subscriber(self.slam_cmd_topic, Twist, self.cb_slam)
+        rospy.Subscriber("/lane_center_offset", Float32, self.cb_offset)
+        rospy.Subscriber("/lane_center_valid",  Bool,    self.cb_valid)
+
+        # IMU 구독 (/imu 토픽은 네가 쓰던 스크립트와 동일)
+        rospy.Subscriber("/imu", Imu, self.cb_imu)
+
+        rospy.loginfo("[LKAS_GUARD] READY (제자리 조향 + 피치 감속 버전)")
+
+        self.spin()
+
+    # =================================
+    # CALLBACKS
+    # =================================
+    def cb_slam(self, msg):
+        with self.lock:
+            self.last_slam_cmd = msg
+            self.last_slam_time = rospy.get_time()
+
+    def cb_offset(self, msg):
+        self.lane_offset = msg.data
+        self.last_lane_time = rospy.get_time()
+
+    def cb_valid(self, msg):
+        self.lane_valid = msg.data
+
+    # ===== IMU 콜백 (네가 쓴 tilt 코드 재활용) =====
+    def cb_imu(self, msg):
+        # 선형가속도 사용해서 roll/pitch 추정
+        ax = msg.linear_acceleration.x
+        ay = msg.linear_acceleration.y
+        az = msg.linear_acceleration.z
+
+        # 가속도 기반 기울기 계산 (네 코드 그대로)
+        pitch = math.atan2(ax, math.sqrt(ay*ay + az*az))
+        # roll = math.atan2(-ay, az)  # 지금은 안 씀
+
+        pitch_deg = pitch * 180.0 / math.pi
+        pitch_deg = self.f_pitch.filt(pitch_deg)
+
+        now = rospy.get_time()
+
+        with self.lock:
+            self.pitch_deg = pitch_deg
+            self.last_imu_time = now
+
+            # 초기 기준 pitch 자동 캘리브레이션 (처음 몇 번 콜백에서)
+            if self.pitch_ref is None:
+                self.pitch_ref = pitch_deg
+                rospy.loginfo("[LKAS_GUARD] Set pitch_ref = %.2f deg" % self.pitch_ref)
+
+    # =================================
+    # MAIN LOOP
+    # =================================
+    def spin(self):
+        r = rospy.Rate(self.rate_hz)
+
+        while not rospy.is_shutdown():
+            now = rospy.get_time()
+
+            with self.lock:
+                slam = self.last_slam_cmd
+                age_slam = now - self.last_slam_time
+                age_lane = now - self.last_lane_time
+                age_imu  = now - self.last_imu_time
+
+                pitch_deg = self.pitch_deg
+                pitch_ref = self.pitch_ref
+
+            cmd = Twist()
+
+            # -------------------------------------
+            # 1) SLAM 명령 없으면 정지
+            # -------------------------------------
+            if age_slam > self.slam_timeout:
+                self.in_override = False
+                self.pub_cmd.publish(cmd)
+                r.sleep()
+                continue
+
+            # 기본 주행 = SLAM
+            cmd = slam
+
+            # -------------------------------------
+            # 1.5) IMU 피치 기반 감속 (방지턱 등)
+            # -------------------------------------
+            # IMU 데이터가 최근에 들어왔고, 기준 pitch가 존재할 때만 사용
+            if (age_imu <= self.imu_timeout) and (pitch_ref is not None):
+                # 기준값에서의 변화량 (deg)
+                dp = abs(pitch_deg - pitch_ref)
+
+                if dp >= self.pitch_slow_start_deg:
+                    # dp가 slow_full 이상이면 최소 속도 비율까지
+                    if dp >= self.pitch_slow_full_deg:
+                        scale = self.pitch_min_speed_scale
+                    else:
+                        # 선형 보간으로 서서히 감속
+                        ratio = (dp - self.pitch_slow_start_deg) / \
+                                (self.pitch_slow_full_deg - self.pitch_slow_start_deg)
+                        scale = 1.0 - (1.0 - self.pitch_min_speed_scale) * ratio
+
+                    # 음수 속도(후진)도 감속되도록 부호는 살리고 크기만 줄임
+                    cmd.linear.x = cmd.linear.x * scale
+
+            # -------------------------------------
+            # 2) LKAS 유효 여부 계산
+            # -------------------------------------
+            lane_ok = (age_lane <= self.lane_timeout) and self.lane_valid
+            offset = self.lane_offset
+
+            # 이탈 여부 판정
+            if lane_ok:
+                if abs(offset) >= self.depart_threshold:
+                    self.in_override = True
+                elif abs(offset) <= self.clear_threshold:
+                    self.in_override = False
+            else:
+                self.in_override = False
+
+            # -------------------------------------
+            # 3) OVERRIDE 동작 (제자리 회전)
+            # -------------------------------------
+            if self.in_override and lane_ok:
+
+                # == 즉시 STOP ==
+                cmd.linear.x = 0.0
+
+                # == 제자리 회전 ==
+                ang = self.lane_gain * offset
+
+                if abs(ang) < self.deadzone:
+                    ang = 0.0
+
+                ang = max(-self.max_ang, min(self.max_ang, ang))
+                ang = self.f_ang.filt(ang)
+
+                cmd.angular.z = ang
+
+                self.pub_cmd.publish(cmd)
+                r.sleep()
+                continue
+
+            # -------------------------------------
+            # 4) 정상 주행 (SLAM + 필터)
+            # -------------------------------------
+            cmd.angular.z = self.f_ang.filt(cmd.angular.z)
+
+            self.pub_cmd.publish(cmd)
+            r.sleep()
+
+
+if __name__ == "__main__":
+    LkasSlamGuard()

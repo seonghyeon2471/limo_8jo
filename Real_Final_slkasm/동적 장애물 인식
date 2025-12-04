@@ -1,0 +1,84 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import rospy
+import math
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+import actionlib
+from move_base_msgs.msg import MoveBaseAction
+from actionlib_msgs.msg import GoalStatus
+
+class DynamicObstacleStopper:
+    def __init__(self):
+        rospy.init_node("dynamic_obstacle_stop")
+
+        # 파라미터
+        self.stop_distance = rospy.get_param("~stop_distance", 0.60)
+        self.resume_delay = rospy.get_param("~resume_delay", 0.2)
+
+        # 상태
+        self.obstacle_detected = False
+
+        # Pub
+        self.cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+
+        # Sub
+        rospy.Subscriber("/scan", LaserScan, self.scan_cb)
+
+        # move_base server (goal 상태 확인용)
+        self.ac = actionlib.SimpleActionClient("move_base", MoveBaseAction)
+        self.ac.wait_for_server()
+
+        rospy.loginfo("[DynamicObstacleStopper] Ready.")
+
+    def scan_cb(self, scan):
+        # 전방 중심  ±20도 범위만 확인
+        ranges = []
+        angle_min = scan.angle_min
+        angle_increment = scan.angle_increment
+
+        for i, r in enumerate(scan.ranges):
+            angle = angle_min + i * angle_increment
+            if -0.35 < angle < 0.35:  # 약 -20도 ~ +20도
+                ranges.append(r)
+
+        if not ranges:
+            return
+
+        min_forward = min(ranges)
+
+        # --- 장애물 감지 (STOP) ---
+        if min_forward < self.stop_distance:
+            if not self.obstacle_detected:
+                rospy.logwarn("⚠️ Dynamic obstacle detected! Stopping.")
+                self.obstacle_detected = True
+                self.publish_stop()
+            return
+
+        # --- 장애물 사라짐 (RESUME) ---
+        if self.obstacle_detected:
+            rospy.loginfo("🟢 Obstacle cleared → Resuming navigation...")
+            self.obstacle_detected = False
+            rospy.sleep(self.resume_delay)
+            self.resume_move_base()
+
+    def publish_stop(self):
+        twist = Twist()
+        twist.linear.x = 0
+        twist.angular.z = 0
+        for _ in range(10):
+            self.cmd_pub.publish(twist)
+            rospy.sleep(0.1)
+
+    def resume_move_base(self):
+        # move_base goal이 abort되었으면 재전송
+        state = self.ac.get_state()
+        if state in [GoalStatus.ABORTED, GoalStatus.REJECTED]:
+            rospy.logwarn("move_base aborted → re-sending last goal is required (external node).")
+        else:
+            rospy.loginfo("move_base goal still active → robot will continue automatically.")
+
+if __name__ == "__main__":
+    DynamicObstacleStopper()
+    rospy.spin()

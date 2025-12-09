@@ -2,28 +2,34 @@
 # -*- coding: utf-8 -*-
 
 """
-LKAS + SLAM Guard + IMU 기반 방지턱 감속 (단순/확실 버전)
+LKAS + SLAM Guard + IMU bump (감속 버전)
 
-- SLAM(/cmd_vel_slam) 기본 추종
-- LKAS:
-    - /lane_center_offset, /lane_center_valid 사용
-    - 이탈 시: 정지 + 제자리 회전
-    - 복귀 시: SLAM으로 원복
-- IMU:
-    - /imu 또는 /imu/data 에서 accel 기반 pitch(deg) 계산
-    - |pitch| >= bump_pitch_deg 이면 bump 모드 ON
-    - bump 모드 동안 선속도 |linear.x| 를 bump_speed_max 로 클램프
+기능 요약
+- 기본: SLAM(/cmd_vel_slam)에서 오는 cmd_vel 그대로 따라감
+- LKAS offset >= depart_threshold 이면:
+    1) 선속도(linear.x) 0으로 정지
+    2) 제자리 회전: angular.z = gain * offset
+- LKAS offset <= clear_threshold 이면:
+    → 다시 SLAM 명령으로 복귀
+
+- IMU bump 플래그(/imu_bump == True)일 때:
+    - 완전 정지 대신
+      → 선속도를 bump_max_speed 로 제한(감속)
+      → SLAM이 더 빠른 속도를 요구해도 그 이상 못 가도록 클램핑
+
+- 로그:
+    [LKAS_GUARD] BUMP ON (|pitch|=xx.xx)  ← pitch 정보는 IMU 노드에서 찍고, 여기선 ON/OFF만 log
+    [LKAS_GUARD] BUMP OFF
 """
 
 import rospy
+import threading
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Float32, Bool
-from sensor_msgs.msg import Imu
-import threading
-import math
 
 
 class EWMA(object):
+    """지수 이동 평균 필터 (노이즈 있는 LKAS offset을 조금 부드럽게)"""
     def __init__(self, alpha=0.6, init_val=0.0):
         self.a = float(alpha)
         self.y = float(init_val)
@@ -45,220 +51,137 @@ class LkasSlamGuard(object):
     def __init__(self):
         rospy.init_node("lkas_slam_guard")
 
-        # ===== 기본 파라미터 =====
-        self.rate_hz = rospy.get_param("~rate", 20)
+        # ---------- 파라미터 설정 ----------
+        # LKAS 차선 이탈 감지 기준
+        self.depart_threshold = rospy.get_param("~depart_threshold", 0.25)  # 이 이상 offset -> 이탈
+        self.clear_threshold  = rospy.get_param("~clear_threshold", 0.10)  # 이 이하 offset -> 복귀
+        self.turn_gain        = rospy.get_param("~turn_gain", 1.5)         # 이탈 시 제자리 회전 gain
 
-        self.slam_cmd_topic = rospy.get_param("~slam_cmd_topic", "/cmd_vel_slam")
-        self.out_cmd_topic  = rospy.get_param("~out_cmd_topic",  "/cmd_vel")
+        # IMU bump 감속 설정
+        self.enable_bump_guard = rospy.get_param("~enable_bump_guard", True)
+        self.bump_max_speed    = rospy.get_param("~bump_max_speed", 0.08)   # bump일 때 최대 선속도 (m/s)
 
-        self.depart_threshold = rospy.get_param("~depart_threshold", 0.25)
-        self.clear_threshold  = rospy.get_param("~clear_threshold",  0.15)
+        # 주기
+        self.control_rate_hz = rospy.get_param("~control_rate", 20.0)
 
-        self.lane_gain = rospy.get_param("~lane_gain", 1.2)
-        if rospy.has_param("~yaw_gain"):
-            # launch 에서 yaw_gain 으로 넘겨줄 수도 있으니 호환
-            self.lane_gain = rospy.get_param("~yaw_gain")
+        # ---------- 내부 상태 ----------
+        self.slam_cmd = Twist()    # SLAM에서 받은 현재 cmd_vel
+        self.offset_raw = 0.0      # LKAS에서 받은 원본 offset
+        self.offset_filt = 0.0     # 필터링된 offset
+        self.offset_filter = EWMA(alpha=0.6, init_val=0.0)
 
-        self.max_ang   = rospy.get_param("~max_ang",   0.9)
-        self.deadzone  = rospy.get_param("~deadzone",  0.05)
+        self.in_depart = False     # 현재 LKAS 이탈 처리 모드인지 여부
 
-        self.slam_timeout = rospy.get_param("~slam_timeout", 0.5)
-        self.lane_timeout = rospy.get_param("~lane_timeout", 0.5)
+        self.bump_active = False   # IMU bump 플래그 (현재 상태)
+        self.prev_bump_active = False
 
-        # ===== IMU / 방지턱 관련 파라미터 =====
-        self.imu_timeout = rospy.get_param("~imu_timeout", 0.5)   # IMU 유효 시간
+        self.cmd_lock = threading.Lock()
 
-        # |pitch| 이 이 값 이상이면 감속 모드 (deg)
-        self.bump_pitch_deg = rospy.get_param("~bump_pitch_deg", 8.0)
-        # 감속 모드일 때 선속도 최대값 (m/s)
-        self.bump_speed_max = rospy.get_param("~bump_speed_max", 0.06)
-        # 감속 모드 최소 유지 시간 (sec)
-        self.bump_hold_time = rospy.get_param("~bump_hold_time", 0.7)
+        # ---------- Pub / Sub ----------
+        # SLAM의 속도 명령
+        self.sub_slam = rospy.Subscriber("cmd_vel_slam", Twist,
+                                         self.cb_slam_cmd, queue_size=1)
 
-        # ===== 상태 =====
-        self.lock = threading.RLock()
+        # LKAS offset (차선 중앙에서 얼마나 벗어났는지)
+        self.sub_offset = rospy.Subscriber("lkas_offset", Float32,
+                                           self.cb_lkas_offset, queue_size=1)
 
-        # SLAM
-        self.last_slam_cmd = Twist()
-        self.last_slam_time = 0.0
+        # IMU bump 플래그
+        self.sub_bump = rospy.Subscriber("imu_bump", Bool,
+                                         self.cb_bump, queue_size=1)
 
-        # LKAS
-        self.lane_offset = 0.0
-        self.lane_valid = False
-        self.last_lane_time = 0.0
-        self.in_override = False
+        # 최종 출력 cmd_vel
+        self.pub_cmd = rospy.Publisher("cmd_vel", Twist, queue_size=1)
 
-        # 조향 필터
-        self.f_ang = EWMA(alpha=0.6, init_val=0.0)
+        # ---------- 메인 루프 타이머 ----------
+        self.timer = rospy.Timer(rospy.Duration(1.0 / self.control_rate_hz),
+                                 self.cb_timer)
 
-        # IMU / pitch
-        self.pitch_deg = 0.0
-        self.last_imu_time = 0.0
-        self.f_pitch = EWMA(alpha=0.5, init_val=0.0)
+        rospy.loginfo("[LKAS_GUARD] Node started (depart=%.2f, clear=%.2f, bump_max_speed=%.2f)",
+                      self.depart_threshold, self.clear_threshold, self.bump_max_speed)
 
-        # 범프 모드
-        self.bump_active = False
-        self.bump_release_time = 0.0
+    # ---------------- 콜백 함수들 ----------------
 
-        # ===== ROS IO =====
-        self.pub_cmd = rospy.Publisher(self.out_cmd_topic, Twist, queue_size=1)
+    def cb_slam_cmd(self, msg):
+        with self.cmd_lock:
+            self.slam_cmd = msg
 
-        rospy.Subscriber(self.slam_cmd_topic, Twist, self.cb_slam)
-        rospy.Subscriber("/lane_center_offset", Float32, self.cb_offset)
-        rospy.Subscriber("/lane_center_valid",  Bool,    self.cb_valid)
+    def cb_lkas_offset(self, msg):
+        self.offset_raw = msg.data
+        self.offset_filt = self.offset_filter.filt(self.offset_raw)
 
-        # /imu /imu/data 둘 다 구독해서 토픽 이름 문제 피하기
-        rospy.Subscriber("/imu", Imu, self.cb_imu)
-        rospy.Subscriber("/imu/data", Imu, self.cb_imu)
+    def cb_bump(self, msg):
+        self.bump_active = bool(msg.data)
 
-        rospy.loginfo("[LKAS_GUARD] READY (LKAS + SLAM + IMU bump slow)")
+        # BUMP ON/OFF edge에서만 로그
+        if self.bump_active and not self.prev_bump_active:
+            rospy.loginfo("[LKAS_GUARD] BUMP ON")
+        elif (not self.bump_active) and self.prev_bump_active:
+            rospy.loginfo("[LKAS_GUARD] BUMP OFF")
 
-        self.spin()
+        self.prev_bump_active = self.bump_active
 
-    # =================================
-    # CALLBACKS
-    # =================================
-    def cb_slam(self, msg):
-        with self.lock:
-            self.last_slam_cmd = msg
-            self.last_slam_time = rospy.get_time()
+    # ---------------- 제어루프 ----------------
 
-    def cb_offset(self, msg):
-        with self.lock:
-            self.lane_offset = msg.data
-            self.last_lane_time = rospy.get_time()
+    def cb_timer(self, event):
+        with self.cmd_lock:
+            slam = self.slam_cmd  # local ref
 
-    def cb_valid(self, msg):
-        with self.lock:
-            self.lane_valid = msg.data
+            out = Twist()
 
-    def cb_imu(self, msg):
-        # accel 기반 pitch 계산
-        ax = msg.linear_acceleration.x
-        ay = msg.linear_acceleration.y
-        az = msg.linear_acceleration.z
+            # 1) 기본은 SLAM 명령을 그대로 따라감
+            out.linear.x  = slam.linear.x
+            out.linear.y  = slam.linear.y
+            out.linear.z  = slam.linear.z
+            out.angular.x = slam.angular.x
+            out.angular.y = slam.angular.y
+            out.angular.z = slam.angular.z
 
-        pitch = math.atan2(ax, math.sqrt(ay * ay + az * az))
-        pitch_deg = pitch * 180.0 / math.pi
+            # 2) LKAS 차선 이탈 가드
+            off = self.offset_filt
 
-        pitch_deg = self.f_pitch.filt(pitch_deg)
-        now = rospy.get_time()
-
-        with self.lock:
-            self.pitch_deg = pitch_deg
-            self.last_imu_time = now
-
-    # =================================
-    # MAIN LOOP
-    # =================================
-    def spin(self):
-        r = rospy.Rate(self.rate_hz)
-
-        while not rospy.is_shutdown():
-            now = rospy.get_time()
-
-            # 상태 복사
-            with self.lock:
-                slam = self.last_slam_cmd
-                age_slam = now - self.last_slam_time
-
-                lane_offset = self.lane_offset
-                lane_valid = self.lane_valid
-                age_lane = now - self.last_lane_time
-
-                pitch_deg = self.pitch_deg
-                age_imu = now - self.last_imu_time
-
-                bump_active = self.bump_active
-                bump_release_time = self.bump_release_time
-
-            cmd = Twist()
-
-            # 1) SLAM 명령 없으면 정지
-            if age_slam > self.slam_timeout:
-                with self.lock:
-                    self.in_override = False
-                self.pub_cmd.publish(cmd)
-                r.sleep()
-                continue
-
-            # 기본은 SLAM cmd 복사
-            cmd = slam
-
-            # 1.5) IMU 기반 bump 감속
-            if age_imu <= self.imu_timeout:
-                # 디버깅용 로그 (0.5초에 한 번)
-                rospy.loginfo_throttle(
-                    0.5,
-                    "[IMU] pitch=%.2f deg, bump=%s" %
-                    (pitch_deg, str(bump_active))
-                )
-
-                # bump 모드 진입/유지/해제
-                if not bump_active:
-                    if abs(pitch_deg) >= self.bump_pitch_deg:
-                        bump_active = True
-                        bump_release_time = now + self.bump_hold_time
-                        rospy.loginfo("[LKAS_GUARD] BUMP ON (|pitch|=%.2f)" % abs(pitch_deg))
+            if self.in_depart:
+                # 이미 이탈 모드인 상태
+                if abs(off) <= self.clear_threshold:
+                    # 충분히 중앙으로 돌아오면 모드 해제
+                    self.in_depart = False
+                    rospy.loginfo("[LKAS_GUARD] Lane cleared (offset=%.3f)", off)
                 else:
-                    # 최소 유지 시간 지나면 pitch 상관 없이 해제 (단순하게)
-                    if now >= bump_release_time:
-                        bump_active = False
-                        rospy.loginfo("[LKAS_GUARD] BUMP OFF")
+                    # 이탈 처리: 제자리 회전
+                    out.linear.x = 0.0
+                    out.angular.z = self.turn_gain * off
+            else:
+                # 평상시 -> 이탈 감지 여부 체크
+                if abs(off) >= self.depart_threshold:
+                    self.in_depart = True
+                    rospy.logwarn("[LKAS_GUARD] Lane departure detected (offset=%.3f)", off)
+                    # 이탈 순간에는 바로 멈추고 회전 시작
+                    out.linear.x = 0.0
+                    out.angular.z = self.turn_gain * off
 
-                # 상태 되돌리기
-                with self.lock:
-                    self.bump_active = bump_active
-                    self.bump_release_time = bump_release_time
+            # 3) IMU bump 감속 가드 (정지 → 감속)
+            if self.enable_bump_guard and self.bump_active:
+                # 선속도 감속: SLAM이 더 크게 요구해도 bump_max_speed 이상 안 가게 제한
+                # (후진하는 경우까지 고려해서 부호는 유지)
+                if out.linear.x > self.bump_max_speed:
+                    out.linear.x = self.bump_max_speed
+                elif out.linear.x < -self.bump_max_speed:
+                    out.linear.x = -self.bump_max_speed
 
-                # 실제 속도 클램프
-                if bump_active:
-                    # cmd.linear.x 가 0이 아니면, 절댓값을 bump_speed_max 로 제한
-                    if cmd.linear.x != 0.0:
-                        sign = 1.0 if cmd.linear.x > 0.0 else -1.0
-                        abs_x = abs(cmd.linear.x)
-                        if abs_x > self.bump_speed_max:
-                            cmd.linear.x = sign * self.bump_speed_max
+                # 필요하면 회전속도도 제한하고 싶을 때 예시:
+                # max_w = 0.5
+                # if out.angular.z > max_w:
+                #     out.angular.z = max_w
+                # elif out.angular.z < -max_w:
+                #     out.angular.z = -max_w
 
-            # 2) LKAS 유효 여부
-            lane_ok = (age_lane <= self.lane_timeout) and lane_valid
-            offset = lane_offset
-
-            with self.lock:
-                if lane_ok:
-                    if abs(offset) >= self.depart_threshold:
-                        self.in_override = True
-                    elif abs(offset) <= self.clear_threshold:
-                        self.in_override = False
-                else:
-                    self.in_override = False
-                in_override = self.in_override
-
-            # 3) LKAS OVERRIDE (제자리 회전)
-            if in_override and lane_ok:
-                cmd.linear.x = 0.0
-
-                ang = self.lane_gain * offset
-                if abs(ang) < self.deadzone:
-                    ang = 0.0
-
-                ang = max(-self.max_ang, min(self.max_ang, ang))
-                ang = self.f_ang.filt(ang)
-                cmd.angular.z = ang
-
-                self.pub_cmd.publish(cmd)
-                r.sleep()
-                continue
-
-            # 4) 정상 주행 (조향 필터만)
-            cmd.angular.z = self.f_ang.filt(cmd.angular.z)
-
-            self.pub_cmd.publish(cmd)
-            r.sleep()
+            # 4) 최종 명령 publish
+            self.pub_cmd.publish(out)
 
 
 if __name__ == "__main__":
     try:
-        LkasSlamGuard()
+        node = LkasSlamGuard()
+        rospy.spin()
     except rospy.ROSInterruptException:
         pass

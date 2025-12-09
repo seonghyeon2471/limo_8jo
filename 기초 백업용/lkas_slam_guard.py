@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-LKAS + SLAM Guard (IMU 제거 버전)
+LKAS + SLAM Guard
 
 - SLAM(cmd_vel_slam)을 기본 추종
 - LKAS offset 이탈 시: 정지 + 제자리 회전

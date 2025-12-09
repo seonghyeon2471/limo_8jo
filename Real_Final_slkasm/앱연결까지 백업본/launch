@@ -1,0 +1,119 @@
+<launch>
+
+  <!-- ========================================================= -->
+  <!-- 1) LIMO 본체 (모터/IMU/TF/기본 bringup)                   -->
+  <!-- ========================================================= -->
+  <include file="$(find limo_bringup)/launch/limo_start.launch">
+    <arg name="pub_odom_tf" value="false"/>
+  </include>
+
+
+  <!-- ========================================================= -->
+  <!-- 2) Astra RGB 카메라 실행                                 -->
+  <!-- ========================================================= -->
+  <include file="$(find astra_camera)/launch/dabai_u3.launch"/>
+
+
+  <!-- ========================================================= -->
+  <!-- 3) LiDAR 기반 Navigation                                 -->
+  <!-- ========================================================= -->
+  <include file="$(find limo_bringup)/launch/limo_navigation_diff.launch"/>
+
+
+  <!-- ========================================================= -->
+  <!-- 4) AR TRACK ALVAR                                        -->
+  <!-- ========================================================= -->
+  <node pkg="ar_track_alvar"
+        type="individualMarkersNoKinect"
+        name="ar_track_alvar"
+        output="screen">
+
+    <!-- 카메라 연결 -->
+    <remap from="camera_image" to="/camera/rgb/image_raw"/>
+    <remap from="camera_info"  to="/camera/rgb/camera_info"/>
+
+    <param name="output_frame" value="camera_rgb_optical_frame"/>
+    <param name="marker_size" value="12.0"/>
+
+    <param name="max_new_marker_error" value="0.25"/>
+    <param name="max_track_error" value="0.20"/>
+    <param name="min_confidence" value="0.001"/>
+  </node>
+
+
+  <!-- ========================================================= -->
+  <!-- 5) LKAS — BEV 기반 차선 중앙 검출                        -->
+  <!-- ========================================================= -->
+  <node pkg="limo_slam_lkas"
+        type="lane_center_bev.py"
+        name="lane_center_bev"
+        output="screen">
+    <param name="image_topic" value="/camera/rgb/image_raw" />
+  </node>
+
+
+  <!-- ========================================================= -->
+  <!-- 6) SLAM + LKAS Guard                                     -->
+  <!-- ========================================================= -->
+  <node pkg="limo_slam_lkas"
+        type="lkas_slam_guard.py"
+        name="lkas_slam_guard"
+        output="screen">
+
+    <param name="slam_cmd_topic" value="/cmd_vel_slam"/>
+    <param name="out_cmd_topic"  value="/cmd_vel"/>
+
+    <param name="path_topic" value="/move_base/TrajectoryPlannerROS/local_plan" />
+    <param name="base_frame" value="base_link" />
+
+    <param name="depart_threshold" value="0.30"/>
+    <param name="clear_threshold"  value="0.18"/>
+
+    <param name="yaw_gain"  value="1.2"/>
+    <param name="max_ang"   value="1.0"/>
+    <param name="deadzone"  value="0.05"/>
+
+    <param name="lookahead_min" value="0.30"/>
+    <param name="lookahead_max" value="0.80"/>
+
+    <param name="slam_timeout" value="0.5"/>
+    <param name="lane_timeout" value="0.5"/>
+    <param name="path_timeout" value="0.7"/>
+  </node>
+
+
+
+  <!-- ========================================================= -->
+  <!-- 7) 🔥 ROSBRIDGE (Flutter 앱과 WebSocket 통신용)          -->
+  <!-- ========================================================= -->
+  <node pkg="rosbridge_server"
+        type="rosbridge_websocket"
+        name="rosbridge_websocket"
+        output="screen">
+    <param name="port" value="9090"/>
+  </node>
+
+
+
+  <!-- ========================================================= -->
+  <!-- 8) 🔥 맵 PNG + YAML 제공 HTTP 서버 (Flutter 사용)       -->
+  <!-- ========================================================= -->
+  <node pkg="limo_slam_lkas"
+        type="map_http_server.py"
+        name="map_http_server"
+        output="screen">
+    <param name="map_file" value="$(find limo_bringup)/maps/test_map.yaml"/>
+    <param name="port" value="8000"/>
+  </node>
+
+
+
+  <!-- ========================================================= -->
+  <!-- 9) 🔥 앱 → ROS 목표 전송 변환기 (/app/goals → /move_base_simple/goal) -->
+  <!-- ========================================================= -->
+  <node pkg="limo_slam_lkas"
+        type="app_goal_receiver.py"
+        name="app_goal_receiver"
+        output="screen"/>
+        
+</launch>

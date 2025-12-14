@@ -1,0 +1,90 @@
+controller_frequency: 5.0
+recovery_behaviour_enabled: true
+
+NavfnROS:
+  allow_unknown: true
+  default_tolerance: 0.1
+
+
+TrajectoryPlannerROS:
+  #### -----------------------------------------
+  ####  Robot Configuration Parameters
+  #### -----------------------------------------
+  acc_lim_x: 2.5
+  acc_lim_theta: 3.2
+
+  # 속도
+  max_vel_x: 0.45         # 살짝 줄이면 흔들림 감소 + 안정적
+  min_vel_x: 0.05         # 0 → 0.05 (정지로 떨어지는 것 방지!)
+
+  max_vel_theta: 1.0
+  min_vel_theta: -1.0
+  min_in_place_vel_theta: 0.25
+
+  holonomic_robot: false
+  escape_vel: -0.15       # 0 → -0.15 (코너 막힘에서 살짝 후진해서 탈출)
+
+
+  #### -----------------------------------------
+  #### Goal Tolerance Parameters
+  #### -----------------------------------------
+  yaw_goal_tolerance: 0.2      # 0.15 → 0.2, 목표 지점 정지 문제 줄어듦
+  xy_goal_tolerance: 0.25
+  latch_xy_goal_tolerance: false
+
+
+  #### -----------------------------------------
+  #### Forward Simulation Parameters
+  #### -----------------------------------------
+  sim_time: 0.8                 # 1.0 → 0.8 (예측 더 짧게, 멈춤 감소)
+  sim_granularity: 0.02
+  angular_sim_granularity: 0.02
+  vx_samples: 6
+  vtheta_samples: 20
+  controller_frequency: 20.0
+
+
+  #### -----------------------------------------
+  #### Trajectory Scoring Parameters
+  #### -----------------------------------------
+  meter_scoring: true
+  occdist_scale: 0.15        # 0.1 → 0.15 (장애물 회피 향상)
+  pdist_scale: 1.8           # 2.5 → 1.8 (path 따라가기 완화 → 멈춤 줄임)
+  gdist_scale: 1.0
+
+  heading_lookahead: 0.20
+  heading_scoring: false
+  heading_scoring_timestep: 0.8
+  dwa: false
+  simple_attractor: false
+  publish_cost_grid_pc: true  
+
+
+  #### -----------------------------------------
+  #### Oscillation Prevention Parameters
+  #### -----------------------------------------
+  oscillation_reset_dist: 0.15   # 0.25 → 0.15 (이상 정지 방지)
+  escape_reset_dist: 0.1
+  escape_reset_theta: 0.1
+
+
+
+DWAPlannerROS:
+  # (DWA는 현재 사용 안 함)
+  acc_lim_x: 2.5
+  acc_lim_y: 0
+  acc_lim_th: 3.2
+
+  max_vel_x: 0.5
+  min_vel_x: 0.0
+  max_vel_y: 0
+  min_vel_y: 0
+
+  max_vel_trans: 0.5
+  min_vel_trans: 0.1
+  max_vel_theta: 1.0
+  min_vel_theta: 0.2
+
+  yaw_goal_tolerance: 0.25
+  xy_goal_tolerance: 0.25
+  latch_xy_goal_tolerance: false
